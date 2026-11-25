@@ -6655,7 +6655,9 @@ def resolve_imatrix_file(imatrix_file, dest_dir, repo_candidates = (), token = N
             files = set(api.list_repo_files(repo))
         except Exception as error:
             # Keeps the first lookup error, reported only when no candidate hits; otherwise a bad token or outage would read as no imatrix exists.
-            if lookup_error is None: lookup_error = f"{repo}: {type(error).__name__}: {error}"
+            if lookup_error is None:
+                from .hf_utils import _scrub_secrets
+                lookup_error = f"{repo}: {type(error).__name__}: {_scrub_secrets(error)}"
             continue
         for name in IMATRIX_UPSTREAM_NAMES:
             if name not in files: continue

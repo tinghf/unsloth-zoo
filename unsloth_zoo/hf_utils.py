@@ -40,6 +40,33 @@ __all__ = [
     "get_auto_processor",
 ]
 
+# A token ends at a character outside [A-Za-z0-9] but not at `_`, so `hf_hub_download` and `hf_xet_fallback` survive.
+_HF_TOKEN_PATTERN = re.compile(r"(?<![A-Za-z0-9_])hf_[A-Za-z0-9]+(?![A-Za-z0-9_])")
+# The value after `Bearer` runs on across a CR/LF, real or escaped by repr(), since a bad paste is two tokens on two lines.
+_BEARER_PATTERN = re.compile(r"(\bbearer\s+)[^\s'\"]+(?:(?:\\[rn]|[\r\n])+[^\s'\"]*)*", re.IGNORECASE)
+
+def _scrub_secrets(text):
+    """`text` with Hugging Face tokens and `Bearer` credentials replaced by `***`, for any text bound for a user."""
+    text = _HF_TOKEN_PATTERN.sub("***", str(text))
+    return _BEARER_PATTERN.sub(r"\1***", text)
+pass
+
+def _clean_hf_token(token):
+    """A string token without surrounding whitespace, or ValueError (never echoing the value) when it has any inside.
+
+    A `\\r\\n` inside a token (two pastes) makes h11 refuse the Authorization header, and the exception prints it.
+    Non-string tokens (None, True, False) are not ours to judge.
+    """
+    if not isinstance(token, str): return token
+    stripped = token.strip()
+    if any(c.isspace() or not c.isprintable() for c in stripped):
+        raise ValueError(
+            "Unsloth: the Hugging Face token is malformed: it contains whitespace, a newline or a control "
+            "character. Copy it again from https://huggingface.co/settings/tokens, with nothing before or after it."
+        )
+    return stripped
+pass
+
 def dtype_from_config(config):
     check_order = ['dtype', 'torch_dtype']
     if HAS_TORCH_DTYPE:

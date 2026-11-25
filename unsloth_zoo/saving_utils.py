@@ -28,7 +28,7 @@ __all__ = [
 import warnings
 from .peft_utils import get_lora_layer_modules
 from .utils import _get_dtype, Version
-from .hf_utils import dtype_from_config
+from .hf_utils import dtype_from_config, _scrub_secrets, _clean_hf_token
 from .private_staging import keep_mode, precreate_private_temp
 from .device_type import DEVICE_TYPE, DEVICE_TYPE_TORCH, device_empty_cache
 from unsloth_zoo.temporary_patches.common import UNSLOTH_ENABLE_LOGGING, logger
@@ -341,6 +341,7 @@ def create_huggingface_repo(
 
     from huggingface_hub import ModelCard, HfApi
     if token is None: token = get_token()
+    token = _clean_hf_token(token)
     api = HfApi(token = token)
     repo_url = api.create_repo(
         repo_id = repo_id,
@@ -353,7 +354,7 @@ def create_huggingface_repo(
             _is_private = getattr(api.repo_info(repo_id = repo_id, repo_type = "model"), "private", None)
         except Exception as exc:
             _is_private = None
-            print(f"Unsloth: Could not confirm the visibility of {repo_id} ({exc}); continuing.")
+            print(f"Unsloth: Could not confirm the visibility of {repo_id} ({_scrub_secrets(exc)}); continuing.")
         if _is_private is False:
             raise RuntimeError(
                 f"Unsloth: private=True was requested but the Hugging Face repo {repo_id!r} already exists and is "
@@ -5576,7 +5577,7 @@ def merge_and_overwrite_lora(
                 raise _hub_unreachable_error(
                     model_name, e,
                     action = f"listing the shards of `{model_name}`",
-                ) from e
+                ) from _hub_error_cause(e)
 
             # Process HF file listing. Same soft filter as the local branch above:
             # drop consolidated.safetensors only when proper shards coexist.
@@ -5600,7 +5601,7 @@ def merge_and_overwrite_lora(
                 except Exception as e:
                     raise _hub_unreachable_error(
                         model_name, e, action = f"listing the shards of `{model_name}`",
-                    ) from e
+                    ) from _hub_error_cause(e)
                 safetensors_list = list(_hub_shard_sizes)
                 if _hub_shard_sizes:
                     max_size_in_bytes = max(_hub_shard_sizes.values())
@@ -8391,19 +8392,54 @@ pass
 def _warn_gated_repo(model_name, e):
     warnings.warn(
         f"Unsloth: `{model_name}` is gated on the Hugging Face Hub and the current "
-        f"token cannot read it ({type(e).__name__}: {e}). Accept the model terms on "
+        f"token cannot read it ({type(e).__name__}: {_scrub_secrets(e)}). Accept the model terms on "
         f"its Hub page, or pass a token that has access. Falling back to a local copy "
         f"if there is one."
     )
 pass
 
+def _is_illegal_header_error(e):
+    """True when `e` or a cause is the HTTP client refusing a header value, which a malformed token produces."""
+    seen = set()
+    while e is not None and id(e) not in seen:
+        seen.add(id(e))
+        if type(e).__name__ == "InvalidHeader" or "illegal header value" in str(e).lower(): return True
+        e = e.__cause__ or e.__context__
+    return False
+pass
+
+def _hub_error_cause(e):
+    """`e` to chain after an error built from it, or None when anything in its chain carries a secret.
+
+    `raise X from e` prints `e` again, and an httpx or requests header error repeats the whole Authorization value.
+    """
+    seen = set()
+    cause = e
+    while cause is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        text = str(cause)
+        if _scrub_secrets(text) != text: return None
+        cause = cause.__cause__ or cause.__context__
+    return e
+pass
+
 def _hub_unreachable_error(model_name, e, action = None, mistaken_for = "a missing model"):
     """`action` and `mistaken_for` name the question the Hub was asked, since "not a
-    missing model" is the wrong reassurance for a caller asking about quantization."""
+    missing model" is the wrong reassurance for a caller asking about quantization.
+
+    The message never carries a token: the exception text is scrubbed, and raise it `from _hub_error_cause(e)`."""
     action = action or f"checking whether `{model_name}` exists"
+    detail = f"{type(e).__name__}: {_scrub_secrets(e)}"
+    if _is_illegal_header_error(e):
+        return RuntimeError(
+            f"Unsloth: the request to the Hugging Face Hub was refused before it was sent, while {action} "
+            f"({detail}). A header value is illegal, which almost always means the Hugging Face token is "
+            f"malformed (whitespace, a newline or a control character in the `token` argument or `HF_TOKEN`). "
+            f"This is not a connectivity problem, and not {mistaken_for}."
+        )
     return RuntimeError(
         f"Unsloth: could not reach the Hugging Face Hub while {action} "
-        f"({type(e).__name__}: {e}). This is a connectivity "
+        f"({detail}). This is a connectivity "
         f"or rate limiting problem, not {mistaken_for}. Retry, or pass a local path."
     )
 pass
@@ -8472,6 +8508,7 @@ def check_hf_model_exists(model_name, token=None):
     """
     # Not a repo id at all (typically a local directory): absent, not unreachable.
     if not _is_hub_repo_id(model_name): return False
+    token = _clean_hf_token(token)
     try:
         file_list = HfFileSystem(token=token).ls(model_name, detail=True)
         if any(x["name"].endswith(".safetensors") for x in file_list): return True
@@ -8489,9 +8526,9 @@ def check_hf_model_exists(model_name, token=None):
         # The single segment rejection is a plain ValueError raised before any socket opens; any other ValueError, such
         # as a JSONDecodeError from a proxy, is a connectivity failure.
         if _is_single_segment_id_rejection(model_name, e): return False
-        raise _hub_unreachable_error(model_name, e) from e
+        raise _hub_unreachable_error(model_name, e) from _hub_error_cause(e)
     except Exception as e:
-        raise _hub_unreachable_error(model_name, e) from e
+        raise _hub_unreachable_error(model_name, e) from _hub_error_cause(e)
 pass
 
 def _hub_repo_weights_without_safetensors(model_name, token = None):
@@ -8781,7 +8818,7 @@ def check_model_quantization_status(model_name_or_path, token=None, local_ok=Tru
                 model_name_or_path, e,
                 action = f"reading the quantization config of `{model_name_or_path}`",
                 mistaken_for = "an unquantized model",
-            ) from e
+            ) from _hub_error_cause(e)
         except _HUB_ABSENT_ERRORS as e:
             # No config.json, or no repo at all: nothing there says the weights are
             # quantized, so `(False, None)` is honest. Unless the reason is
@@ -8799,13 +8836,13 @@ def check_model_quantization_status(model_name_or_path, token=None, local_ok=Tru
                     model_name_or_path, gated,
                     action = f"reading the quantization config of `{model_name_or_path}`",
                     mistaken_for = "an unquantized model",
-                ) from e
+                ) from _hub_error_cause(e)
         except Exception as e:
             raise _hub_unreachable_error(
                 model_name_or_path, e,
                 action = f"reading the quantization config of `{model_name_or_path}`",
                 mistaken_for = "an unquantized model",
-            ) from e
+            ) from _hub_error_cause(e)
 
         if config_path is not None:
             config = _load_quant_config_or_raise(config_path, model_name_or_path)
